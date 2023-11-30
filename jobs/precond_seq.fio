@@ -1,0 +1,16 @@
+[global]
+percentile_list=${percentile_list}
+ioengine=${ioengine}
+direct=1
+thread
+group_reporting
+
+[fio_job_configs]
+name=precond_seqwrite_${bs}_j${numjobs}_q${iodepth}
+rw=write
+rwmixread=0
+bs=${bs}
+numjobs=${numjobs}
+iodepth=${iodepth}
+fill_device=1
+loops=2

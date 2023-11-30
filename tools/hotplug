@@ -1,0 +1,18 @@
+#/bin/bash
+
+nvme_dev=$1
+
+dev_path=`find /sys/devices/pci* -name ${nvme_dev}`
+dev_bdf=${dev_path%/nvme/nvme*}
+slt_bdf=${dev_bdf}
+dev_bdf=${dev_bdf##*/}
+slt_bdf=${slt_bdf%/*}
+slt_bdf=${slt_bdf##*/}
+
+echo "dev pth: ${dev_path}"
+echo "dev bdf: ${dev_bdf}"
+echo "slt bdf: ${slt_bdf}"
+if [ ! -z "${dev_bdf}" ]
+then
+    lspci -s $slt_bdf -vv | grep -e SltCap: -e SltCtl: -e SltSta: -A 1
+fi

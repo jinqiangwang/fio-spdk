@@ -1,0 +1,22 @@
+#!/bin/bash
+
+export percentile_list=1:5:10:25:50:75:90:95:99:99.5:99.9:99.99:99.999:99.9999:99.99999:99.999999
+export ioengine=${ioengine-libaio}
+
+export ramp_time=60
+export ramp_time_randwrite=1800
+export runtime=1200
+export workloads=( \
+###  rw|bs|jobs|iodepth # DO NOT add any space in strings below
+    "precond_seq|128k|1|128" \
+    "seqread|128k|1|64" \
+    "seqwrite|128k|1|128" \
+    "randread|4k|8|256" \
+    "randwrite|4k|8|32" \
+    "randrw55|4k|8|32" \
+    "randrw28|4k|8|32" \
+    "randrw82|4k|8|32" \
+    "randrw37|4k|8|32" \
+    "randrw73|4k|8|32" \
+    )
+

@@ -1,0 +1,3 @@
+#!/bin/bash
+
+export random_map_opts=${random_map_opts-" --norandommap=1  --randrepeat=0 "}

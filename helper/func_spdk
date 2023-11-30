@@ -1,0 +1,35 @@
+#!/bin/bash -x
+
+function setup_spdk() {
+    spdk_root_dir=$1
+    white_list="$2"
+    huge_mem=$3
+
+    echo ${white_list}
+
+    if [ -z "${huge_mem}" ]
+    then
+        huge_mem=1024
+    fi
+    # PCI_ALLOWED="${white_list}" ${spdk_dir}/scripts/setup.sh
+    # HUGEMEM=${huge_mem} PCI_ALLOWED="${white_list}" ${spdk_root_dir}/scripts/setup.sh > /dev/null 2>&1
+    HUGEMEM=${huge_mem} PCI_ALLOWED="${white_list}" ${spdk_root_dir}/scripts/setup.sh
+}
+
+function reset_spdk() {
+    spdk_root_dir=$1
+    white_list=$2
+
+    if [ ! -z "${white_list}" ]; then
+        PCI_WHITELIST="${white_list}" ${spdk_root_dir}/scripts/setup.sh reset > /dev/null 2>&1
+
+        # reset nvme drive names to original order
+        for bdf in ${white_list}; do
+            echo ${bdf} > /sys/bus/pci/drivers/nvme/unbind
+        done
+
+        for bdf in ${white_list}; do
+            echo ${bdf} > /sys/bus/pci/drivers/nvme/bind
+        done
+    fi
+}

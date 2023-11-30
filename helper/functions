@@ -1,0 +1,436 @@
+#/bin/bash
+
+function trap_ctrlc() {
+    # fio_pid_list is defined in fio-spdk.sh
+    kill -9 ${fio_pid_list}
+    echo "kill fio [${fio_pid_list}] =$? (0 = success)"
+
+    if [ ! -z "${iostat_pid}" ]; then
+        kill -9 ${iostat_pid}
+        echo "kill iostat [${iostat_pid}] =$? (0 = success)"
+    fi
+
+    # spdk_dir is defined in fio-spdk.sh
+    if [ "${type}" == "spdk" ]; then
+        echo "reverting spdk setup ..."
+        reset_spdk ${spdk_dir} "${spdk_white_list}"
+        echo "revert spdk setup done"
+    fi
+    exit 1
+}
+trap trap_ctrlc SIGINT
+
+function nvme2busid() {
+    drv_name=$1
+    bdf=$(ls -l /sys/class/block/${drv_name} | sed -r "s#.*/([0-9A-Fa-f\:\.]+)/nvme/.*#\1#g")
+    echo ${bdf}
+}
+
+function nvme2busid_spdk() {
+    drv_name=$1
+    bdf=$(nvme2busid ${drv_name})
+    echo ${bdf//:/.}
+}
+
+function get_os_id() {
+    source /etc/os-release
+    echo ${ID}
+}
+
+function get_os_verid() {
+    source /etc/os-release
+    echo ${VERSION_ID}
+}
+
+function get_os_str() {
+    os_str=
+    
+    case $(get_os_id) in
+        centos | rhel)
+            os_str=centos-$(get_os_verid)            
+            ;;
+        openEuler)
+            os_str=openeuler-$(get_os_verid)
+            ;;
+        ctyunos)
+            # CTYunOs is built on top of openEuler
+            case $(get_os_verid) in
+                2.0.1)
+                    os_str=openeuler-20.03
+                    ;;
+            esac
+            ;;
+        *)
+            ;;
+    esac
+    echo ${os_str}
+}
+
+get_os_str
+
+function collect_nvme_info() {
+    drv_name=$1
+    
+    echo "`nvme smart-log /dev/${drv_name}`"
+    echo ""
+    echo "`nvme intel smart-log-add /dev/${drv_name}`"
+    echo ""
+    echo "`grep . /sys/block/${drv_name}/queue/*`"
+    ch_dev=$(echo ${drv_name} | cut -d"n" -f 1-2)
+    echo ""
+    echo "`grep ${ch_dev} /proc/interrupts | sed -r "s/\s+/,/g"`"
+    echo ""
+}
+
+function collect_drv_info() {
+    drv_name=$1
+
+    if [[ `ls ${drv_name} 2>/dev/null` ]] || [[ `ls /dev/${drv_name} 2>/dev/null` ]]
+    then
+        if [[ `echo ${drv_name} | grep /dev/` ]]
+        then
+            drv_name=${drv_name#/dev/}
+        fi
+
+        if [[ "${drv_name::4}" == "nvme" ]]
+        then
+            collect_nvme_info ${drv_name}
+        fi
+    fi
+}
+
+function collect_sys_info() {
+    echo -e "[nvme-list]"
+    echo -e "`nvme list`"
+    echo -e "[busid]"
+    echo -e "`find /sys/devices/pci* -name "nvme*"`"
+    echo -e "\n[cpu]"
+    echo "`lscpu`"
+    echo "`grep MHz /proc/cpuinfo`"
+    echo -e "\n[memory]"
+    echo "`free -m`"
+    echo -e "\n[lsblk]"
+    echo "`lsblk`"
+    echo -e "\n[df]"
+    echo "`df -h`"
+    echo -e "\n[filesystem]"
+    echo "`mount`"
+    echo "[lspci]"
+    echo -e "`lspci -vvv -xxxx`"
+    echo -e "\n[dmidecode]"
+    echo "`dmidecode`"
+}
+
+function iostat_to_csv() {
+    data_dir=$1
+    if [[ ! -d ${data_dir} ]]; then return 1; fi
+
+    iostat_ver=`iostat -V | grep -m1 -i sysstat | cut -d" " -f3 | cut -d\. -f1`
+    if [[ ${iostat_ver} -lt 11 ]]
+    then
+        iofields="4-9,14"
+        cpufields="1-2,4"
+    else
+        iofields="2-5,12-14,16"
+        cpufields="1-2,4"
+    fi
+
+    for fiostat in `ls ${data_dir}/*.iostat`
+    do
+        barename=${fiostat/*\/}; barename=${barename/.iostat}
+        ts=${data_dir}/${barename}.ts
+        io_out=${data_dir}/${barename}.io
+        cpu_out=${data_dir}/${barename}.cpu
+
+        echo "timestamp" > ${ts}
+        grep -E "[0-9]+:[0-9]+:" ${fiostat} >> ${ts}
+
+        grep -m1 Device ${fiostat} | sed -r "s/\s+/,/g" | cut -d, -f ${iofields} > ${io_out}
+        grep -e nvme -e sd -e vd ${fiostat} | sed -r "s/\s+/,/g"  | cut -d, -f ${iofields} >> ${io_out}
+
+        grep -m1 avg-cpu ${fiostat} | sed -r "s/\s+/,/g" | cut -d, -f ${cpufields} > ${cpu_out}
+        grep -A1 avg-cpu ${fiostat} | grep -v \- | sed -r "s/\s+/,/g" | cut -d, -f ${cpufields} >> ${cpu_out}
+        
+        paste -d, ${ts} ${io_out} ${cpu_out} > ${data_dir}/${barename}.csv
+        rm -f ${ts} ${io_out} ${cpu_out}
+    done
+}
+
+function iostat_to_csv_1() {
+    data_dir=$1
+    dev_name=$2 # nvme0n1 or nvme1n1
+    if [[ ! -d ${data_dir} ]]; then return 1; fi
+
+    iostat_ver=`iostat -V | grep -m1 -i sysstat | cut -d" " -f3 | cut -d\. -f1`
+    if [[ ${iostat_ver} -lt 11 ]]
+    then
+        iofields="4-9,14"
+        cpufields="1-2,4"
+    else
+        iofields="2-5,12-14,16"
+        cpufields="1-2,4"
+    fi
+
+    for fiostat in `ls ${data_dir}/*.iostat`
+    do
+        barename=${fiostat/*\/}; barename=${barename/.iostat}
+        ts=${data_dir}/${dev_name}_${barename}.ts
+        io_out=${data_dir}/${dev_name}_${barename}.io
+        cpu_out=${data_dir}/${dev_name}_${barename}.cpu
+        csv_file=${data_dir}/${dev_name}_${barename}.csv
+
+        echo "timestamp" > ${ts}
+        grep -E "[0-9]+:[0-9]+:" ${fiostat} >> ${ts}
+
+        grep -m1 Device ${fiostat} | sed -r "s/\s+/,/g" | cut -d, -f ${iofields} > ${io_out}
+        grep -e ${dev_name} ${fiostat} | sed -r "s/\s+/,/g"  | cut -d, -f ${iofields} >> ${io_out}
+
+        grep -m1 avg-cpu ${fiostat} | sed -r "s/\s+/,/g" | cut -d, -f ${cpufields} > ${cpu_out}
+        grep -A1 avg-cpu ${fiostat} | grep -v \- | sed -r "s/\s+/,/g" | cut -d, -f ${cpufields} >> ${cpu_out}
+        
+        paste -d, ${ts} ${io_out} ${cpu_out} > ${csv_file}
+        rm -f ${ts} ${io_out} ${cpu_out}
+    done
+}
+
+function fio_to_csv() {
+    data_dir=$1
+    disk=$2
+    if [[ ! -d ${data_dir} ]]; then return 1; fi
+
+    header=0
+    for f in `ls -tr ${data_dir}/${disk}_* | grep -e .fio -e .log`
+    do
+        disk_name=${f/*\/}; disk_name=${disk_name/[-_]*}
+        job_name=${data_dir}/${disk_name}_job_name.csv
+        io_pattern=${data_dir}/${disk_name}_io_pattern.csv
+        bw_iops_csv=${data_dir}/${disk_name}_bw_iops.csv
+        clat_percentile=${data_dir}/${disk_name}_per_lat.csv
+        lat_csv=${data_dir}/${disk_name}_lat.csv
+        report=${data_dir}/${disk_name}_summary.csv
+        if [[ ${header} -eq 0 ]]
+        then
+            header=1
+            echo "job name" > ${job_name}
+            echo "pattern" > ${io_pattern}
+            echo "I/O,KIOPS,BW (MiB/s),BW (MB/s)" > ${bw_iops_csv}
+            echo "lat unit,min,max,avg,stdev" > ${lat_csv}
+            echo "clat unit,90th,99th,99.9th,99.99th,99.999th,99.9999th,99.99999th,99.999999th" > ${clat_percentile}
+        fi
+        
+        grep -e rw= ${f} | sed -r -e "s/(.*):\s\(.*/\1/g" >> ${job_name}
+        if [ ! -z "`grep rw=randrw ${f}`" ] || [ ! -z "`grep rw=rw ${f}`" ]; then echo >> ${job_name}; fi
+        grep -e rw= ${f} | \
+            sed -r -e "s/.*rw=(randrw),.*/\1\n/g" \
+                   -e "s/.*rw=(rw),.*/\1\n/g" \
+                   -e "s/.*rw=([a-z]+),.*/\1/g" \
+                   >> ${io_pattern}
+        grep -e BW= ${f} | sed -r \
+             -e "s/\s*(.*):\s*IOPS=([0-9\.kKmM]+),\s*BW=([0-9\.kKmMgGtTibB]+)\/s\s*\(([0-9\.kKmMgGtTibB]+)\/s\).*/\1,\2,\3,\4/g" \
+             >> ${bw_iops_csv}
+        grep -e "\slat\s.*avg=" ${f} | sed -r \
+             -e "s/^\s+lat\s*\(([a-z]+)\)\s*:\s*min=\s*([0-9]+),\s+max=\s*([0-9\.kK]+),\s+avg=\s*([0-9\.]+),\sstdev=\s*([0-9\.]+).*/\1,\2,\3,\4,\5/g" \
+        >> ${lat_csv}
+
+        # extract clat tail latencies
+        tail_lats=("90.0{6}th=" "99.0{6}th=" "99.90{5}th=" "99.9{2}0{4}th=" "99.9{3}0{3}th=" "99.9{4}0{2}th=" "99.9{5}0th=" "99.9{6}th=")
+        grep percentiles ${f} | sed -r "s/.*\(([a-z]+)\).*/\1/g" > ${clat_percentile}.tmp3
+        for tail_lat in ${tail_lats[@]}
+        do
+            grep -E ${tail_lat} ${f} | sed -r -e "s/.*${tail_lat}\[\s*([0-9]+)\].*/\1/g" > ${clat_percentile}.tmp1
+            if [ -e ${clat_percentile}.tmp3 ]
+            then 
+                paste -d, ${clat_percentile}.tmp3 ${clat_percentile}.tmp1 > ${clat_percentile}.tmp2
+                mv -f ${clat_percentile}.tmp2 ${clat_percentile}.tmp3 
+            else
+                mv -f ${clat_percentile}.tmp1 ${clat_percentile}.tmp3
+            fi
+        done
+        cat ${clat_percentile}.tmp3 >> ${clat_percentile}
+        rm -f ${clat_percentile}.tmp*
+    done
+    paste -d, ${job_name} ${io_pattern} ${bw_iops_csv} ${lat_csv} ${clat_percentile} > ${report}
+    rm -f ${job_name} ${io_pattern} ${bw_iops_csv} ${lat_csv} ${clat_percentile} 
+}
+
+function consolidate_summary() {
+    data_dir=$1
+    out_dir=$2
+    if [[ ! -d ${data_dir} ]]; then return 1; fi
+    if [[ ! -d ${out_dir} ]]; then out_dir=${data_dir}; fi
+
+    header_collcted=0
+    headers=${data_dir}/headers.tmp
+    suffix=_summary.csv
+    for f in `ls ${data_dir}/*${suffix} | sort -V`
+    do
+        disk_name=${f/*\/}; disk_name=${disk_name/_*}
+        result=${data_dir}/${disk_name}.result
+        if [[ ${header_collcted} -eq 0 ]]
+        then
+            header_collcted=1
+            header_txt=`cat $f | cut -d, -f1-3`
+            echo "KIOPS"          > ${headers}
+            echo "${header_txt}" >> ${headers}
+            echo ""              >> ${headers}
+            # echo "BW (MiB/s)"    >> ${headers}
+            # echo "${header_txt}" >> ${headers}
+            # echo ""              >> ${headers}
+            echo "BW (MB/s)"     >> ${headers}
+            echo "${header_txt}" >> ${headers}
+            echo ""              >> ${headers}
+            echo "avg lat"       >> ${headers}
+            echo "${header_txt}" >> ${headers}
+            echo ""              >> ${headers}
+            # echo "99.9th clat"   >> ${headers}
+            # echo "${header_txt}" >> ${headers}
+            # echo ""              >> ${headers}
+            echo "99.99th clat"  >> ${headers}
+            echo "${header_txt}" >> ${headers}
+        fi
+
+#---> header
+        echo "" > ${result}
+        echo ${disk_name} >> ${result}
+        cat $f | grep -v IOPS | cut -d, -f 4 >> ${result}
+        echo "" >> ${result}
+        echo "" >> ${result}
+        ##---> BW MiB/s
+        # echo ${disk_name} >> ${result}
+        # cat $f | grep -v BW   | cut -d, -f 5 >> ${result}
+        # echo "" >> ${result}
+        # echo "" >> ${result}
+        #---> BW MB/s
+        echo ${disk_name} >> ${result}
+        cat $f | grep -v BW   | cut -d, -f 6 >> ${result}
+        echo "" >> ${result}
+        echo "" >> ${result}
+        #---> lat avg
+        echo ${disk_name}, >> ${result}
+        cat $f | grep -v BW   | cut -d, -f 7,10 >> ${result}
+        echo "" >> ${result}
+        echo "" >> ${result}
+        ##---> lat 99.9th
+        # echo ${disk_name}, >> ${result}
+        # cat $f | grep -v BW   | cut -d, -f 12,15 >> ${result}
+        # echo "" >> ${result}
+        # echo "" >> ${result}
+        #--->lat 99.99th
+        echo ${disk_name}, >> ${result} 
+        cat $f | grep -v BW   | cut -d, -f 12,16 >> ${result}
+
+        result_list="${result_list} ${result}"
+    done
+
+    paste -d, ${headers} ${result_list} > ${out_dir}/result_summary.csv
+    rm ${headers} ${result_list}
+}
+
+function collect_temperature() {
+    dev_name=$1
+
+    echo `nvme smart-log ${dev_name} \
+         | grep -e nvme -e temperature \
+         | sed -r -e "s/.*:(nvme[0-9]+n1).*/\1/g" -e "s/.*: ([0-9]+) C.*/\1/g"` \
+         | sed -r "s/\s+/,/g"
+}
+
+function calculate_wa() {
+    data_dir=$1
+    disk=$2
+    workload=$3
+
+    prefix=${data_dir}/${disk}_${workload}
+
+    host_bytes_written_1=$(grep host_bytes_written ${prefix}_1.info | sed -r -e "s/://g" -e "s/\s+/,/g" | cut -d, -f 4)
+    nand_bytes_written_1=$(grep nand_bytes_written ${prefix}_1.info | sed -r -e "s/://g" -e "s/\s+/,/g" | cut -d, -f 4)
+    host_bytes_written_2=$(grep host_bytes_written ${prefix}_2.info | sed -r -e "s/://g" -e "s/\s+/,/g" | cut -d, -f 4)
+    nand_bytes_written_2=$(grep nand_bytes_written ${prefix}_2.info | sed -r -e "s/://g" -e "s/\s+/,/g" | cut -d, -f 4)
+
+    host_written=$((${host_bytes_written_2}-${host_bytes_written_1}))
+    nand_written=$((${nand_bytes_written_2}-${nand_bytes_written_1}))
+
+    if [ ${host_written} -gt 0 ]
+    then
+        echo "${disk},${workload},${host_written},${nand_written},"$(awk -v n=${nand_written} -v h=${host_written} 'BEGIN { printf("%.2f", n/h) }')
+    else
+        echo "${disk},${workload},${host_written},${nand_written},""N/A"
+    fi
+}
+
+# detect if block devices is mounted or has file system
+function nvme_has_mnt_pnt() {
+    drv=$1
+    retcode=0
+    mnt_pnt=$(lsblk -f -o kname,fstype,mountpoint | grep ${drv} | sed -r "s/\s+/,/g" | cut -d, -f 2,3)
+    if [ ! -z "${mnt_pnt}" ]
+    then
+        retcode=1
+    fi
+    return ${retcode}
+}
+
+function verify_workload_item() {
+    job_dir=$1
+    myworkload=$2
+    ret=0
+
+    wl_fields=($(echo ${myworkload} | sed -r "s/\s+//g" | sed "s/|/ /g"))
+
+    if [ ${#wl_fields[@]} -ne 4 ]; then
+        echo "workload [${myworkload}] must have 4 fields, [i/o pattern, bs, numjobs, iodepth]"
+        return 1
+    fi
+    
+    case_name=${wl_fields[0]}
+    bs=${wl_fields[1]}
+    numjobs=${wl_fields[2]}
+    iodepth=${wl_fields[3]}
+
+    if [ ! -f ${job_dir}/${case_name}.fio ]; then
+        echo "workload - case file for [${case_name}] does not exist, [${job_dir}/${case_name}.fio]"
+        ret=$(($ret+1))
+    fi
+
+    if [ -z "`echo ${bs} | grep -E -e ^[0-9]+[kKmM]+$ -e ^[0-9]+$`" ]; then
+        echo "workload - bs [${bs}] is invalid"
+        ret=$(($ret+1))
+    fi
+
+    if [ -z "`echo ${numjobs} | grep -E ^[0-9]+$`" ]; then
+        echo "workload - numjobs [${numjobs}] is invalid"
+        ret=$(($ret+1))
+    fi
+
+    if [ -z "`echo ${iodepth} | grep -E ^[0-9]+$`" ]; then
+        echo "workload - iodepth [${iodepth}] is invalid"
+        ret=$(($ret+1))
+    fi
+
+    return ${ret}
+}
+
+function verify_workloads() {
+    job_dir=$1
+    invalid_wl=0
+
+    for myworkload in ${workloads[@]}; do
+        verify_workload_item "${job_dir}" "${myworkload}"
+        if [ $? -ne 0 ]; then
+            invalid_wl=$((invalid_wl+1))
+        fi
+    done
+
+    return ${invalid_wl}
+}
+
+function prep_workload() {
+    myworkload=$1
+    wl_fields=($(echo ${myworkload} | sed "s/|/ /g"))
+    case_name=${wl_fields[0]}
+    bs=${wl_fields[1]}
+    numjobs=${wl_fields[2]}
+    iodepth=${wl_fields[3]}
+
+    echo "${case_name} ${case_name}_${bs}_j${numjobs}_qd${iodepth} ${bs} ${numjobs} ${iodepth}"
+}
