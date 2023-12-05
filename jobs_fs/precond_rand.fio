@@ -1,0 +1,16 @@
+[global]
+percentile_list=${percentile_list}
+ioengine=${ioengine}
+direct=1
+thread
+group_reporting
+
+[fio_job_configs]
+name=precond_randwrite_${bs}_j${numjobs}_q${iodepth}
+rw=randwrite
+rwmixread=0
+bs=${bs}
+numjobs=${numjobs}
+iodepth=${iodepth}
+runtime=${ramp_time_randwrite}
+time_based

@@ -16,6 +16,17 @@ function trap_ctrlc() {
         reset_spdk ${spdk_dir} "${spdk_white_list}"
         echo "revert spdk setup done"
     fi
+
+    if [ ! -z ${remove_mntpoint} ] && [ ${remove_mntpoint} -ne 0 ]; then
+        for disk in ${disks[@]}; do
+            for i in {1..10}; do
+                umount /dev/${disk} -f
+                ret=$?
+                if [ ${ret} -ne 0 ] && [ ${ret} -ne 32 ]; then sleep 0.2; else break; fi
+            done
+            wipefs -a /dev/${disk}
+        done
+    fi
     exit 1
 }
 trap trap_ctrlc SIGINT
